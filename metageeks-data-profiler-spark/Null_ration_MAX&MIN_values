@@ -1,0 +1,43 @@
+from pyspark.sql import SparkSession
+import json
+import boto3
+import io
+
+# Create SparkSession
+spark = SparkSession.builder.appName("NullValueCounter").getOrCreate()
+
+path = "s3://file-data-source-bucket/data service ltd/2023-04-28/studentData_20230428-11_28_38.csv"
+
+# Read the data into a DataFrame
+data = spark.read.csv(path, header=True, inferSchema=True)
+
+# Count null values in each column
+null_counts = {}
+total_rows = data.count()
+for col_name in data.columns:
+    null_count = data.filter(data[col_name].isNull()).count()
+    null_counts[col_name] = null_count / total_rows
+
+# Fetch minimum and maximum values for DATE/NUMERIC columns
+min_values = {}
+max_values = {}
+for column in data.columns:
+    column_data = data.select(column).dropna()
+    column_type = str(column_data.schema.fields[0].dataType)
+    if "date" in column_type.lower() or "integertype" in column_type.lower():
+        min_value = column_data.agg({"*": "min"}).collect()[0][0]
+        max_value = column_data.agg({"*": "max"}).collect()[0][0]
+        min_values[column] = min_value
+        max_values[column] = max_value
+print(min_values)
+print(max_value)
+result_dict = {"null_counts": null_counts, "min_values": min_values, "max_values": max_values}
+
+# Convert the dictionary to JSON format
+json_output = json.dumps(result_dict)
+print(json_output)
+bucket_name = "metageeks-data-profile-results"
+output_path = "null_ratio_AND_MIN_MAX_valueresult"
+file_extention="json"
+s3=boto3.client("s3")
+s3.put_object(Bucket=bucket_name, Key=output_path+"."+file_extention, Body=json_output)
