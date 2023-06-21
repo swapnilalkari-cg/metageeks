@@ -1,0 +1,194 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, length, explode_outer, current_timestamp, date_format
+import json
+import boto3
+import io
+import re
+import pymysql
+import os
+from datetime import datetime
+
+# Create a SparkSession
+spark = SparkSession.builder.appName("NullValueCounter").getOrCreate()
+path = "s3://file-data-source-bucket/data service ltd/2023-04-28/studentData_20230428-11_28_38.csv"
+
+
+# Read the data into a DataFrame
+data = spark.read.csv(path, header=True, inferSchema=True)
+# Extract the filename from the path
+filename = os.path.basename(path)
+
+
+# Get the schema of the DataFrame
+schema = data.schema
+
+# Convert schema to dictionary
+schema_dict = {}
+column_uniqueness = {}
+cntr = 1
+total_rows = data.count()
+min_storage_sum = 0
+max_storage_sum = 0
+
+for field in schema.fields:
+    result = {}
+    result["columnPosition"] = cntr
+    result["dataType"] = str(field.dataType)
+    null_count = data.filter(data[field.name].isNull()).count()
+    result["nullRatio"] = null_count / total_rows
+    column_data = data.select(field.name).dropna()
+    column_type = str(column_data.schema.fields[0].dataType)
+    distinct_count = data.select(field.name).distinct().count()
+    result["uniquenessPercentage"] = (distinct_count / total_rows) * 100
+    column_uniqueness[field.name] = result
+    if "date" in column_type.lower() or "integertype" in column_type.lower():
+        min_value = column_data.agg({"*": "min"}).collect()[0][0]
+        max_value = column_data.agg({"*": "max"}).collect()[0][0]
+        min_value_percentage = (
+            column_data.filter(column_data[field.name] == min_value).count() / total_rows * 100
+        )
+        max_value_percentage = (
+            column_data.filter(column_data[field.name] == max_value).count() / total_rows * 100
+        )
+        result["minValue"] = min_value
+        result["minValuePercentage"] = min_value_percentage
+        result["maxValue"] = max_value
+        result["maxValuePercentage"] = max_value_percentage
+    else:
+        result["minValue"] = "NA"
+        result["maxValue"] = "NA"
+    max_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "max"}).collect()[0][0]
+    result["maxLength"] = max_length
+    min_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "min"}).collect()[0][0]
+    result["minlength"] = min_length
+    avg_length = data.select(length(col(field.name))).agg({"length(" + field.name + ")": "avg"}).collect()[0][0]
+    result["avglength"] = avg_length
+
+    distinct_count = 0
+    pattern_char = r"[a-zA-Z]"
+    pattern_num = r"\d"
+    pattern_special = r"[!@#$%^&*\"(),.?:{}|<>]"
+    onlychar = 0
+    onlynum = 0
+    charnum = 0
+    charsp = 0
+    numsp = 0
+    all3 = 0
+    for row in data.select(field.name).collect():
+        string = row[field.name]
+        if isinstance(string, str):
+            pass
+        else:
+            string = str(string)
+
+        if string.isalpha() and onlychar == 0:
+            distinct_count += 1
+            onlychar = 1
+        elif string.isdigit() and onlynum == 0:
+            distinct_count += 1
+            onlynum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_num, string)) and not bool(
+            re.search(pattern_special, string)
+        ) and charnum == 0:
+            distinct_count += 1
+            charnum = 1
+        elif bool(re.search(pattern_char, string)) and bool(re.search(pattern_special, string)) and not bool(
+            re.search(pattern_num, string)
+        ) and charsp == 0:
+            distinct_count += 1
+            charsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_num, string)) and not bool(
+            re.search(pattern_char, string)
+        ) and numsp == 0:
+            distinct_count += 1
+            numsp = 1
+        elif bool(re.search(pattern_special, string)) and bool(re.search(pattern_char, string)) and bool(
+            re.search(pattern_num, string)
+        ) and all3 == 0:
+            distinct_count += 1
+            all3 = 1
+    if str(field.dataType) == "IntegerType":
+        min_storage = -avg_length * 2
+        max_storage = avg_length * 2
+    elif str(field.dataType) == "StringType":
+        min_storage = 0
+        max_storage = avg_length
+    result["minStorage(Bytes)"] = min_storage
+    result["maxStorage(Bytes)"] = max_storage
+    result["distinctCount"] = distinct_count
+    schema_dict[field.name] = result
+    cntr += 1
+    min_storage_sum += min_storage
+    max_storage_sum += max_storage
+
+    schema_dict["minStorage(Bytes)"] = min_storage_sum
+    schema_dict["maxStorage(Bytes)"] = max_storage_sum
+    
+
+
+# Print the schema dictionary
+print(schema_dict)
+
+json_output = json.dumps(schema_dict, indent=4)
+
+# Store the JSON output in an S3 bucket
+bucket_name = "metageeks-data-profile-results"
+output_path = "inferschema_result.json"
+
+s3 = boto3.client("s3")
+s3.put_object(Bucket=bucket_name, Key=output_path, Body=json_output)
+
+# Connect to the RDS database
+endpoint = "database-1.codti4vj2iqk.us-east-2.rds.amazonaws.com"
+username = "admin12"
+password = "Capgemini#12"
+database_name = "mg-data-profile-db"
+connection = pymysql.connect(host=endpoint, user=username, passwd=password, db=database_name)
+
+# Fetch the current date
+now = datetime.now()
+current_date = now.strftime("%Y-%m-%d %H:%M:%S")
+
+# Insert the JSON output into the data_profile_result table and data_profiler
+cursor = connection.cursor()
+json1 =json.loads(json_output)
+del json1['minStorage(Bytes)']
+
+del json1['maxStorage(Bytes)']
+
+for i in json1:
+    colpos = json1[i]['columnPosition']
+    datatype = json1[i]['dataType']
+    del json1[i]['columnPosition']
+    del json1[i]['dataType']
+    print(colpos)
+    print(datatype)
+    print(json1[i]) 
+    
+    cursor.execute(
+        "INSERT INTO data_profile_result (run_date, run_data_object_name, Column_profile_result, column_name, column_position, column_datatype) VALUES (%s, %s, %s, %s, %s, %s)",
+        (current_date, filename, json.dumps(json1[i]), i, colpos, datatype)
+    )
+
+    connection.commit()
+
+# # Check if the values can be converted to float
+# min_storage = float(min_storage_sum) if isinstance(min_storage_sum, (int, float)) else None
+# max_storage = float(max_storage_sum) if isinstance(max_storage_sum, (int, float)) else None    
+    
+summary_json = {
+    "minStorage(Bytes)": min_storage,
+    "maxStorage(Bytes)": max_storage
+}
+summary_json_str = json.dumps(summary_json)
+
+# Insert the summary JSON output into the profile_summary table
+cursor.execute(
+    "INSERT INTO profile_summary (run_date, data_object_name, profile_summary) VALUES (%s, %s, %s)",
+    (current_date, filename, summary_json_str)
+)
+
+connection.commit()
+
+# Close the database connection
+connection.close()
