@@ -1,0 +1,77 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import expr
+from pyspark.sql.functions import col, length
+from pyspark.sql.functions import collect_list
+from pyspark.sql.functions import col, regexp_replace
+from datetime import datetime
+import json
+import boto3
+import io
+import re
+import pymysql
+import os
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+def read_parquet_file(spark, path):
+    return spark.read.parquet(path)
+
+dataProfilerSparkSession = SparkSession.builder.appName("NullValueCounter").getOrCreate()
+
+# Create a GlueContext
+glueContext = GlueContext(dataProfilerSparkSession)
+
+json_dynamic_frame=glueContext.create_dynamic_frame_from_options("s3", {'paths': ["s3://metageeks-dataprofile-params/dataprofile-input-params.json"], 'recurse':True, 'groupFiles': 'inPartition', 'groupSize': '1048576'}, format="json")
+json_data_frame = json_dynamic_frame.toDF()
+inputDataObjParameter=json_data_frame.select(col("dataObjectName")).first()[0]
+dataFrameForProfile = read_parquet_file(dataProfilerSparkSession, inputDataObjParameter)
+# if ".csv" in path:
+filename=os.path.basename(inputDataObjParameter[0:len(inputDataObjParameter)-1])
+# Create a temporary view for the DataFrame
+dataFrameForProfile.createOrReplaceTempView("temp_view")
+
+# Get the column names
+columns = dataFrameForProfile.columns
+# Define the DataFrame df from the temporary view
+df = dataProfilerSparkSession.sql("SELECT * FROM temp_view")
+
+distinct_values = {}
+distinct_values_json = {}
+
+# Convert patterns to 'A' and '9' for each column
+for column in columns:
+    replace_statement = f"REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER({column}), 'A', 'A'), 'B', 'A'), 'C', 'A'), 'D', 'A'), 'E', 'A'), 'F', 'A'), 'G', 'A'), 'H', 'A'), 'I', 'A'), 'J', 'A'), 'K', 'A'), 'L', 'A'), 'M', 'A'), 'N', 'A'), 'O', 'A'), 'P', 'A'), 'Q', 'A'), 'R', 'A'), 'S', 'A'), 'T', 'A'), 'U', 'A'), 'V', 'A'), 'W', 'A'), 'X', 'A'), 'Y', 'A'), 'Z', 'A'), '0', '9'), '1', '9'), '2', '9'), '3', '9'), '4', '9'), '5', '9'), '6', '9'), '7', '9'), '8', '9'), '9', '9') AS {column}_replaced"
+    df = df.withColumn(column + "_replaced", expr(replace_statement))
+
+    # Find distinct values for each replaced column
+    distinct_values[column] = df.select(column + "_replaced").distinct().limit(10).rdd.flatMap(lambda x: x).collect()
+
+# Print the distinct values for each column
+for column, values in distinct_values.items():
+    print(f"{column}:")
+    print(values)
+    print()
+
+# Convert distinct values to JSON format
+json_data = json.dumps(distinct_values, indent=4)
+
+# Print the JSON data
+print(json_data)
+
+# Fetch the current date
+now = datetime.now()
+current_date = now.strftime("%Y-%m-%d %H:%M:%S")
+# Connect to the RDS database
+endpoint = "database-1.codti4vj2iqk.us-east-2.rds.amazonaws.com"
+username = "admin12"
+password = "Capgemini#12"
+database_name = "mg-data-profile-db"
+connection = pymysql.connect(host=endpoint, user=username, passwd=password, db=database_name)
+cursor = connection.cursor()
+cursor.execute(
+    "INSERT INTO data_profile_pattern ( run_date,data_object_name,distinct_pattern) VALUES ( %s,%s,%s )",
+    ( current_date,filename,json_data)
+)
+
+connection.commit()
+# Close the database connection
+connection.close()
